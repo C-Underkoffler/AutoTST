@@ -322,6 +322,142 @@ def update_known_reactions(path, reactions, known_species, method='', shortDesc=
 
     return r_db, old_r_db, new_r_db
 
+def rote_save_reactions(path, r_db):
+    """
+    TransitionStateDepositories currently save distance data under "kinetics" instead of "distances", along with other minor descrepencies between the database it loads vs the one it will save.
+    
+    This method saves the entries as it currently expects it to be laoded (the old way?)
+    """
+    f = open(path, 'w')
+
+    for entry in r_db.entries.values():
+        f.write('entry(\n')
+        f.write('\tindex = {},\n'.format(entry.index))
+        f.write('\tlabel = "{}",\n'.format(entry.label))
+        f.write('\tdegeneracy = {},\n'.format(entry.item.degeneracy))
+        f.write('\tdistances = DistanceData(\n')
+        f.write('\t\tdistances = {},\n'.format(entry.data.distances))
+        f.write("\t\tmethod = '{}',\n".format(entry.data.method))
+        f.write('\t),\n')
+        if entry.rank is not None:
+            f.write('\trank = {},\n'.format(entry.rank))
+        
+        f.write('\tshortDesc = u"""{}""",\n'.format(entry.shortDesc))
+        f.write(')\n\n')
+    
+    f.close()
+    return
+
+def find_duplicate_reactions(r_database, power):
+    """
+    Provided TransitionStateDepository of reactions, checks the reactions for duplicates:
+    
+    clean_entries:     No duplicates found in the same direction (reverse reactions allowed)
+    swapped_dists:     Duplicates in the same direction, distances are similar but have mismatched keys 
+                            (possibly data labelled incorrectly)
+    similar_dists:     Duplicates in the same direction, distances closely agree (per tolerance) and are labelled the same
+    big_diff:          Duplicates in the same direction, large diference in distances
+                            relative to supplied tolerance
+    pairs:             Pairs of forward and reverse reactions
+    tolerance:         Metric used to determine similarity of distances, 10**-power
+    """
+    
+    checked_entries = []
+    
+    # Entries that do not have a duplicate in the same direction
+    clean_entries = {}
+    # For reactions that are isomorphic, but TS geometry seems to be mislablled (d12 and d23 swapped for example)
+    swapped_dists = []
+    # For reactions that are isomorphic, and TS geometry is very similar per the given tolerance
+    similar_dists = {}
+    # For isomporphic reactions that have distances that vary greater than the given tolerance
+    big_diff = []
+    # Keeping track of forward and reverse reaction pairs
+    pairs = {}
+    # Tolerance used to diffrentiate between acceptably similar geometries and those that are conflicting  
+    tolerance = 10**-power
+
+    logging.info('Tolerance of {} for duplicate reaction check'.format(tolerance))
+
+    for entry in r_database.entries.values():
+        reaction = entry.item
+        distances = entry.data.distances
+        clean = True
+
+        for c_entry in checked_entries:
+            c_reaction = c_entry.item
+            c_distances = c_entry.data.distances
+
+            if reaction.isIsomorphic(c_reaction, eitherDirection = False):
+                #Check if reaction is isomorphic and in same direction
+                
+                clean = False
+                if c_entry in clean_entries.keys():
+                    # Backtracking to make sure all entries in the following are clean
+                    del clean_entries[c_entry]
+                
+                if c_entry in pairs.keys():
+                    # Backtracking to make sure all entries in the following are clean
+                    del pairs[c_entry]
+
+                ds = [round(distances[key], power) for key in distances]
+                c_ds = [round(c_distances[key], power) for key in c_distances]
+
+                if set(sorted(ds)) == set(sorted(c_ds)):
+                    #Similar values, but maybe not the same keys (swapped)
+
+                    avg_d = {}
+                    for key in distances:
+                        d = distances[key]
+                        c_d = c_distances[key]
+
+                        if abs(d-c_d) < tolerance:
+                            #Only take average if distances are very similar
+                            avg_d[key] = (d+c_d)/2
+
+                    if len(avg_d) != len(distances):
+                        # Keys don't align: Swapped
+                        swapped_dists.append([entry, c_entry])
+                    elif len(avg_d) == len(distances):
+                        # Keys most likely align and so the distances are very similar
+                        similar_dists[entry] = c_entry, avg_d
+                        
+                else:
+                    #Not at all similar based off of tolerance (power)
+                    """print reaction
+                    print c_reaction
+                    print distances
+                    print c_distances
+                    print
+                    print avg_d
+                    assert False"""
+                    big_diff.append([entry, c_entry])
+            elif reaction.isIsomorphic(c_reaction, eitherDirection = True):
+                #Check there is forward and reverse of all clean reactions
+                # entry gets added to pairs if it has a pair, later removed if it is not clean
+                pairs[entry] = c_entry
+                
+        
+        if clean:
+            clean_entries[entry] = 1
+        else:
+            if entry in pairs.keys():
+                del pairs[entry]
+           
+
+        checked_entries.append(entry)
+        
+    # Should be unique already but just to be sure
+    clean_entries = list(set(clean_entries))
+    
+    logging.info('Total Entries: {}'.format(len(checked_entries)))
+    logging.info("Swapped Distances: {}".format(len(swapped_dists)))
+    logging.info("Not swapped and off: {}".format(len(big_diff)))
+    logging.info("Both directions: {}".format(len(pairs)))
+    logging.info("Clean Entries: {}".format(len(clean_entries)))
+    
+    return clean_entries, swapped_dists, big_diff, similar_dists
+
 
 def update_databases(reactions, method='', shortDesc='', reaction_family=''):
     """
@@ -334,7 +470,7 @@ def update_databases(reactions, method='', shortDesc='', reaction_family=''):
     import logging
     import os
 
-    assert isinstance(reactions, list), 'Must provide list of auto-TST reaction objects even if there is only one reaction'
+    assert isinstance(reactions, list), 'Must provide list of AutoTST reaction objects even if there is only one reaction'
     assert len(reactions) > 0
 
     if reaction_family == '':
@@ -343,7 +479,8 @@ def update_databases(reactions, method='', shortDesc='', reaction_family=''):
 
     general_path = os.path.join(os.path.expandvars('$RMGpy'), '..', 'AutoTST', 'database', reaction_family, 'TS_training')
     dict_path = os.path.join(general_path, 'dictionary.txt')
-    new_dict_path = os.path.join(general_path, 'updated_dictionary.txt')
+    #new_dict_path = os.path.join(general_path, 'updated_dictionary.txt')
+    new_dict_path = os.path.join(general_path, 'dictionary.txt')
     old_reactions_path = os.path.join(general_path, 'reactions.py')
     new_reactions_path = os.path.join(general_path, 'updated_reactions.py')
 
@@ -375,11 +512,14 @@ def update_databases(reactions, method='', shortDesc='', reaction_family=''):
                                                   shortDesc = shortDesc
                                                  )
 
-    #TODO add check for duplicates method
-    #if check_reactions_database():
     if True:
-        logging.warning('No duplicate check for reactions database')
-        r_db.save(new_reactions_path)
+        #Duplicae check is possible (method above), but it should be done manually
+        logging.warning("Have not yet checked for duplicates in reactions database")
+        
+        #Commented out because of discrepency with how object expect database when it loads vs what it saves
+        #r_db.save(new_reactions_path)
+        
+        rote_save_reactions(new_reactions_path, r_db)
         if len(reactions) < 5:
             for reaction in reactions:
                 logging.info('{} saved and species dictionary updated'.format(reaction))
@@ -387,7 +527,7 @@ def update_databases(reactions, method='', shortDesc='', reaction_family=''):
             logging.info('Reactions and their species saved to...\n{}\n...and...\n{}\n...respectively'.format(new_reactions_path, new_dict_path))
     return
 
-#################################################################################################################################
+##################################################################################################################################
 
 def TS_Database_Update(families, path = None, auto_save = False):
     """
